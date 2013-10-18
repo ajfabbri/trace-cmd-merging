@@ -45,6 +45,7 @@
 #include <errno.h>
 
 #include "trace-local.h"
+#include "trace-msg.h"
 
 #define _STR(x) #x
 #define STR(x) _STR(x)
@@ -59,15 +60,9 @@
 #define STAMP		"stamp"
 #define FUNC_STACK_TRACE "func_stack_trace"
 
-#define UDP_MAX_PACKET (65536 - 20)
-
 static int tracing_on_init_val;
 
 static int rt_prio;
-
-static int use_tcp;
-
-static unsigned int page_size;
 
 static int buffer_size;
 
@@ -75,17 +70,18 @@ static const char *output_file = "trace.dat";
 
 static int latency;
 static int sleep_time = 1000;
-static int cpu_count;
 static int recorder_threads;
 static int *pids;
 static int buffers;
 
 static char *host;
-static int *client_ports;
 static int sfd;
 
 /* Max size to let a per cpu file get */
 static int max_kb;
+
+struct tracecmd_output *virt_handle;
+static bool virt;
 
 static int do_ptrace;
 
@@ -98,6 +94,8 @@ static unsigned recorder_flags;
 
 /* Try a few times to get an accurate date */
 static int date2ts_tries = 5;
+
+static int proto_ver = V2_PROTOCOL;
 
 struct func_list {
 	struct func_list *next;
@@ -1583,6 +1581,9 @@ static int create_recorder(struct buffer_instance *instance, int cpu, int extrac
 	if (client_ports) {
 		connect_port(cpu);
 		recorder = tracecmd_create_recorder_fd(client_ports[cpu], cpu, recorder_flags);
+	} else if (virt_sfds) {
+		recorder = tracecmd_create_recorder_fd(virt_sfds[cpu], cpu,
+						       recorder_flags);
 	} else {
 		file = get_temp_file(instance, cpu);
 		recorder = create_recorder_instance(instance, file, cpu);
@@ -1607,20 +1608,26 @@ static int create_recorder(struct buffer_instance *instance, int cpu, int extrac
 	exit(0);
 }
 
-static void communicate_with_listener(int fd)
+static void check_first_msg_from_server(int fd)
+{
+	char buf[BUFSIZ];
+
+	read(fd, buf, 8);
+
+	/* Make sure the server is the tracecmd server */
+	if (memcmp(buf, "tracecmd", 8) != 0)
+		die("server not tracecmd server");
+}
+
+static void communicate_with_listener_v1_nw(int fd)
 {
 	char buf[BUFSIZ];
 	ssize_t n;
 	int cpu, i;
 
-	n = read(fd, buf, 8);
-
-	/* Make sure the server is the tracecmd server */
-	if (memcmp(buf, "tracecmd", 8) != 0)
-		die("server not tracecmd server");
+	check_first_msg_from_server(fd);
 
 	/* write the number of CPUs we have (in ASCII) */
-
 	sprintf(buf, "%d", cpu_count);
 
 	/* include \0 */
@@ -1675,6 +1682,52 @@ static void communicate_with_listener(int fd)
 	}
 }
 
+static void communicate_with_listener_v2_nw(int fd)
+{
+	if (tracecmd_msg_send_init_data_nw(fd) < 0)
+		die("Cannot communicate with server");
+}
+
+static void check_protocol_version(int fd)
+{
+	char buf[BUFSIZ];
+
+	check_first_msg_from_server(fd);
+
+	/*
+	 * Write the protocol version, the magic number, and the dummy
+	 * option(0) (in ASCII). The client understands whether the client
+	 * uses the v2 protocol or not by checking a reply message from the
+	 * server. If the message is "V2", the server uses v2 protocol. On the
+	 * other hands, if the message is just number strings, the server
+	 * returned port numbers. So, in that time, the client understands the
+	 * server uses the v1 protocol. However, the old server tells the
+	 * client port numbers after reading cpu_count, page_size, and option.
+	 * So, we add the dummy number (the magic number and 0 option) to the
+	 * first client message.
+	 */
+	write(fd, "V2\0"V2_MAGIC"0", sizeof(V2_MAGIC)+4);
+
+	/* read a reply message */
+	read(fd, buf, BUFSIZ);
+
+	if (!buf[0]) {
+		/* the server uses the v1 protocol, so we'll use it */
+		proto_ver = V1_PROTOCOL;
+		plog("Use the v1 protocol\n");
+	} else {
+		if (memcmp(buf, "V2", 2) != 0)
+			die("Cannot handle the protocol %s", buf);
+		/* OK, let's use v2 protocol */
+	}
+}
+
+static void communicate_with_listener_virt(int fd)
+{
+	if (tracecmd_msg_connect_to_server(fd) < 0)
+		die("Cannot communicate with server");
+}
+
 static void setup_network(void)
 {
 	struct tracecmd_output *handle;
@@ -1703,6 +1756,7 @@ static void setup_network(void)
 	hints.ai_family = AF_UNSPEC;
 	hints.ai_socktype = SOCK_STREAM;
 
+again:
 	s = getaddrinfo(server, port, &hints, &result);
 	if (s != 0)
 		die("getaddrinfo: %s", gai_strerror(s));
@@ -1723,18 +1777,56 @@ static void setup_network(void)
 
 	freeaddrinfo(result);
 
-	communicate_with_listener(sfd);
+	if (proto_ver == V2_PROTOCOL) {
+		check_protocol_version(sfd);
+		if (proto_ver == V1_PROTOCOL) {
+			/* reconnect to the server for using the v1 protocol */
+			close(sfd);
+			goto again;
+		}
+		communicate_with_listener_v2_nw(sfd);
+	}
+
+	if (proto_ver == V1_PROTOCOL)
+		communicate_with_listener_v1_nw(sfd);
 
 	/* Now create the handle through this socket */
 	handle = tracecmd_create_init_fd_glob(sfd, listed_events);
 
+	if (proto_ver == V2_PROTOCOL)
+		tracecmd_msg_finish_sending_metadata(sfd);
+
 	/* OK, we are all set, let'r rip! */
+}
+
+static void setup_virtio(void)
+{
+	int fd;
+
+	fd = open(AGENT_CTL_PATH, O_RDWR);
+	if (fd < 0)
+		die("Cannot open %s", AGENT_CTL_PATH);
+
+	communicate_with_listener_virt(fd);
+
+	/* Now create the handle through this socket */
+	virt_handle = tracecmd_create_init_fd_glob(fd, listed_events);
+	tracecmd_msg_finish_sending_metadata(fd);
 }
 
 static void finish_network(void)
 {
+	if (proto_ver == V2_PROTOCOL)
+		tracecmd_msg_send_close_msg();
 	close(sfd);
 	free(host);
+}
+
+static void finish_virt(void)
+{
+	tracecmd_msg_send_close_msg();
+	free(virt_handle);
+	free(virt_sfds);
 }
 
 static void start_threads(void)
@@ -1744,6 +1836,8 @@ static void start_threads(void)
 
 	if (host)
 		setup_network();
+	else if (virt)
+		setup_virtio();
 
 	/* make a thread for every CPU we have */
 	pids = malloc_or_die(sizeof(*pids) * cpu_count * (buffers + 1));
@@ -1787,6 +1881,9 @@ static void record_data(char *date2ts, struct trace_seq *s)
 
 	if (host) {
 		finish_network();
+		return;
+	} else if (virt) {
+		finish_virt();
 		return;
 	}
 
@@ -2279,6 +2376,7 @@ static void record_all_events(void)
 }
 
 enum {
+	OPT_virt	= 252,
 	OPT_nosplice	= 253,
 	OPT_funcstack	= 254,
 	OPT_date	= 255,
@@ -2350,6 +2448,7 @@ void trace_record (int argc, char **argv)
 			{"date", no_argument, NULL, OPT_date},
 			{"func-stack", no_argument, NULL, OPT_funcstack},
 			{"nosplice", no_argument, NULL, OPT_nosplice},
+			{"virt", no_argument, NULL, OPT_virt},
 			{"help", no_argument, NULL, '?'},
 			{NULL, 0, NULL, 0}
 		};
@@ -2461,6 +2560,8 @@ void trace_record (int argc, char **argv)
 		case 'o':
 			if (host)
 				die("-o incompatible with -N");
+			if (virt)
+				die("-o incompatible with --virt");
 			if (!record && !extract)
 				die("start does not take output\n"
 				    "Did you mean 'record'?");
@@ -2492,6 +2593,8 @@ void trace_record (int argc, char **argv)
 		case 'N':
 			if (!record)
 				die("-N only available with record");
+			if (virt)
+				die("-N incompatible with --virt");
 			if (output)
 				die("-N incompatible with -o");
 			host = optarg;
@@ -2504,6 +2607,8 @@ void trace_record (int argc, char **argv)
 			max_kb = atoi(optarg);
 			break;
 		case 't':
+			if (virt)
+				die("-t incompatible with --virt");
 			use_tcp = 1;
 			break;
 		case 'b':
@@ -2529,6 +2634,17 @@ void trace_record (int argc, char **argv)
 			break;
 		case OPT_nosplice:
 			recorder_flags |= TRACECMD_RECORD_NOSPLICE;
+			break;
+		case OPT_virt:
+			if (!record)
+				die("--virt only available with record");
+			if (host)
+				die("--virt incompatible with -N");
+			if (output)
+				die("--virt incompatible with -o");
+			if (use_tcp)
+				die("--virt incompatible with -t");
+			virt = true;
 			break;
 		default:
 			usage(argv);
@@ -2605,6 +2721,8 @@ void trace_record (int argc, char **argv)
 			latency = 1;
 			if (host)
 				die("Network tracing not available with latency tracer plugins");
+			if (virt)
+				die("Virtio-trace not available with latency tracer plugins");
 		}
 		if (fset < 0 && (strcmp(plugin, "function") == 0 ||
 				 strcmp(plugin, "function_graph") == 0))

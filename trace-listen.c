@@ -23,9 +23,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <getopt.h>
+#include <grp.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <sys/epoll.h>
+#include <sys/un.h>
 #include <netdb.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -33,6 +37,7 @@
 #include <errno.h>
 
 #include "trace-local.h"
+#include "trace-msg.h"
 
 #define MAX_OPTION_SIZE 4096
 
@@ -45,19 +50,27 @@ static FILE *logfp;
 
 static int debug;
 
-static int use_tcp;
-
 static int backlog = 5;
 
-#define  TEMP_FILE_STR "%s.%s:%s.cpu%d", output_file, host, port, cpu
-static char *get_temp_file(const char *host, const char *port, int cpu)
+static int proto_ver;
+
+#define  TEMP_FILE_STR_NW "%s.%s:%s.cpu%d", output_file, host, port, cpu
+#define  TEMP_FILE_STR_VIRT "%s.%s:%d.cpu%d", output_file, domain, virtpid, cpu
+static char *get_temp_file(const char *host, const char *port,
+			   const char *domain, int virtpid, int cpu)
 {
 	char *file = NULL;
 	int size;
 
-	size = snprintf(file, 0, TEMP_FILE_STR);
-	file = malloc_or_die(size + 1);
-	sprintf(file, TEMP_FILE_STR);
+	if (host) {
+		size = snprintf(file, 0, TEMP_FILE_STR_NW);
+		file = malloc_or_die(size + 1);
+		sprintf(file, TEMP_FILE_STR_NW);
+	} else {
+		size = snprintf(file, 0, TEMP_FILE_STR_VIRT);
+		file = malloc_or_die(size + 1);
+		sprintf(file, TEMP_FILE_STR_VIRT);
+	}
 
 	return file;
 }
@@ -80,11 +93,15 @@ static void signal_setup(int sig, sighandler_t handle)
 	sigaction(sig, &action, NULL);
 }
 
-static void delete_temp_file(const char *host, const char *port, int cpu)
+static void delete_temp_file(const char *host, const char *port,
+			     const char *domain, int virtpid, int cpu)
 {
 	char file[MAX_PATH];
 
-	snprintf(file, MAX_PATH, TEMP_FILE_STR);
+	if (host)
+		snprintf(file, MAX_PATH, TEMP_FILE_STR_NW);
+	else
+		snprintf(file, MAX_PATH, TEMP_FILE_STR_VIRT);
 	unlink(file);
 }
 
@@ -112,10 +129,13 @@ static int process_option(char *option)
 	return 0;
 }
 
-static int done;
+static struct tracecmd_recorder *recorder;
+
 static void finish(int sig)
 {
-	done = 1;
+	if (recorder)
+		tracecmd_stop_recording(recorder);
+	done = true;
 }
 
 #define LOG_BUF_SIZE 1024
@@ -144,7 +164,7 @@ static void __plog(const char *prefix, const char *fmt, va_list ap,
 	fprintf(fp, "%.*s", r, buf);
 }
 
-static void plog(const char *fmt, ...)
+void plog(const char *fmt, ...)
 {
 	va_list ap;
 
@@ -153,7 +173,7 @@ static void plog(const char *fmt, ...)
 	va_end(ap);
 }
 
-static void pdie(const char *fmt, ...)
+void pdie(const char *fmt, ...)
 {
 	va_list ap;
 	char *str = "";
@@ -184,7 +204,7 @@ static void process_udp_child(int sfd, const char *host, const char *port,
 
 	signal_setup(SIGUSR1, finish);
 
-	tempfile = get_temp_file(host, port, cpu);
+	tempfile = get_temp_file(host, port, NULL, 0, cpu);
 	fd = open(tempfile, O_WRONLY | O_TRUNC | O_CREAT, 0644);
 	if (fd < 0)
 		pdie("creating %s", tempfile);
@@ -225,16 +245,37 @@ static void process_udp_child(int sfd, const char *host, const char *port,
 	exit(0);
 }
 
+#define SLEEP_DEFAULT	1000
+
+static void process_virt_child(int fd, int cpu, int pagesize,
+			       const char *domain, int virtpid)
+{
+	char *tempfile;
+
+	signal_setup(SIGUSR1, finish);
+	tempfile = get_temp_file(NULL, NULL, domain, virtpid, cpu);
+
+	recorder = tracecmd_create_recorder_virt(tempfile, cpu, fd);
+
+	do {
+		if (tracecmd_start_recording(recorder, SLEEP_DEFAULT) < 0)
+			break;
+	} while (!done);
+
+	tracecmd_free_recorder(recorder);
+	put_temp_file(tempfile);
+	exit(0);
+}
+
 #define START_PORT_SEARCH 1500
 #define MAX_PORT_SEARCH 6000
 
-static int open_udp(const char *node, const char *port, int *pid,
-		    int cpu, int pagesize, int start_port)
+static int udp_bind_a_port(int start_port, int *sfd)
 {
 	struct addrinfo hints;
 	struct addrinfo *result, *rp;
-	int sfd, s;
 	char buf[BUFSIZ];
+	int s;
 	int num_port = start_port;
 
  again:
@@ -250,15 +291,15 @@ static int open_udp(const char *node, const char *port, int *pid,
 		pdie("getaddrinfo: error opening udp socket");
 
 	for (rp = result; rp != NULL; rp = rp->ai_next) {
-		sfd = socket(rp->ai_family, rp->ai_socktype,
-			     rp->ai_protocol);
-		if (sfd < 0)
+		*sfd = socket(rp->ai_family, rp->ai_socktype,
+			      rp->ai_protocol);
+		if (*sfd < 0)
 			continue;
 
-		if (bind(sfd, rp->ai_addr, rp->ai_addrlen) == 0)
+		if (bind(*sfd, rp->ai_addr, rp->ai_addrlen) == 0)
 			break;
 
-		close(sfd);
+		close(*sfd);
 	}
 
 	if (rp == NULL) {
@@ -270,20 +311,83 @@ static int open_udp(const char *node, const char *port, int *pid,
 
 	freeaddrinfo(result);
 
+	return num_port;
+}
+
+static void fork_reader(int sfd, const char *node, const char *port,
+			int *pid, int cpu, int pagesize, const char *domain,
+			int virtpid)
+{
 	*pid = fork();
 
 	if (*pid < 0)
-		pdie("creating udp reader");
+		pdie("creating reader");
 
-	if (!*pid)
-		process_udp_child(sfd, node, port, cpu, pagesize);
+	if (!*pid) {
+		if (node)
+			process_udp_child(sfd, node, port, cpu, pagesize);
+		else
+			process_virt_child(sfd, cpu, pagesize, domain, virtpid);
+	}
 
 	close(sfd);
+}
+
+static void fork_udp_reader(int sfd, const char *node, const char *port,
+			    int *pid, int cpu, int pagesize)
+{
+	fork_reader(sfd, node, port, pid, cpu, pagesize, NULL, 0);
+}
+
+static void fork_virt_reader(int sfd, int *pid, int cpu, int pagesize,
+			     const char *domain, int virtpid)
+{
+	fork_reader(sfd, NULL, NULL, pid, cpu, pagesize, domain, virtpid);
+}
+
+static int open_udp(const char *node, const char *port, int *pid,
+		    int cpu, int pagesize, int start_port)
+{
+	int sfd;
+	int num_port;
+
+	/*
+	 * udp_bind_a_port() currently does not return an error, but if that
+	 * changes in the future, we have a check for it now. 
+	 */
+	num_port = udp_bind_a_port(start_port, &sfd);
+	if (num_port < 0)
+		return num_port;
+
+	fork_udp_reader(sfd, node, port, pid, cpu, pagesize);
 
 	return num_port;
 }
 
-static int communicate_with_client(int fd, int *cpus, int *pagesize)
+#define TRACE_CMD_DIR		"/tmp/trace-cmd/"
+#define VIRT_DIR		TRACE_CMD_DIR "virt/"
+#define VIRT_TRACE_CTL_SOCK	VIRT_DIR "agent-ctl-path"
+#define TRACE_PATH_DOMAIN_CPU	VIRT_DIR "%s/trace-path-cpu%d.out"
+
+static int open_virtio_serial_pipe(int *pid, int cpu, int pagesize,
+				   const char *domain, int virtpid)
+{
+	char buf[PATH_MAX];
+	int fd;
+
+	snprintf(buf, PATH_MAX, TRACE_PATH_DOMAIN_CPU, domain, cpu);
+	fd = open(buf, O_RDONLY | O_NONBLOCK);
+	if (fd < 0) {
+		warning("open %s", buf);
+		return fd;
+	}
+
+	fork_virt_reader(fd, pid, cpu, pagesize, domain, virtpid);
+
+	return fd;
+}
+
+static int communicate_with_client_nw(int fd, int *cpus, int *pagesize)
 {
 	char buf[BUFSIZ];
 	char *option;
@@ -302,56 +406,78 @@ static int communicate_with_client(int fd, int *cpus, int *pagesize)
 
 	*cpus = atoi(buf);
 
-	plog("cpus=%d\n", *cpus);
-	if (*cpus < 0)
-		return -1;
+	/* Is the client using the new protocol? */
+	if (!*cpus) {
+		if (memcmp(buf, "V2", 2) != 0) {
+			plog("Cannot handle the protocol %s", buf);
+			return -1;
+		}
 
-	/* next read the page size */
-	n = read_string(fd, buf, BUFSIZ);
-	if (n == BUFSIZ)
-		/** ERROR **/
-		return -1;
+		/* read the rest of dummy data, but not use */
+		read(fd, buf, sizeof(V2_MAGIC)+1);
 
-	*pagesize = atoi(buf);
+		proto_ver = V2_PROTOCOL;
 
-	plog("pagesize=%d\n", *pagesize);
-	if (*pagesize <= 0)
-		return -1;
+		/* Let the client know we use v2 protocol */
+		write(fd, "V2", 2);
 
-	/* Now the number of options */
-	n = read_string(fd, buf, BUFSIZ);
-	if (n == BUFSIZ)
-		/** ERROR **/
-		return -1;
+		/* read the CPU count, the page size, and options */
+		if (tracecmd_msg_initial_setting(fd, cpus, pagesize) < 0)
+			return -1;
+	} else {
+		/* The client is using the v1 protocol */
 
-	options = atoi(buf);
+		plog("cpus=%d\n", *cpus);
+		if (*cpus < 0)
+			return -1;
 
-	for (i = 0; i < options; i++) {
-		/* next is the size of the options */
+		/* next read the page size */
 		n = read_string(fd, buf, BUFSIZ);
 		if (n == BUFSIZ)
 			/** ERROR **/
 			return -1;
-		size = atoi(buf);
-		/* prevent a client from killing us */
-		if (size > MAX_OPTION_SIZE)
-			return -1;
-		option = malloc_or_die(size);
-		do {
-			t = size;
-			s = 0;
-			s = read(fd, option+s, t);
-			if (s <= 0)
-				return -1;
-			t -= s;
-			s = size - t;
-		} while (t);
 
-		s = process_option(option);
-		free(option);
-		/* do we understand this option? */
-		if (!s)
+		*pagesize = atoi(buf);
+
+		plog("pagesize=%d\n", *pagesize);
+		if (*pagesize <= 0)
 			return -1;
+
+		/* Now the number of options */
+		n = read_string(fd, buf, BUFSIZ);
+		if (n == BUFSIZ)
+			/** ERROR **/
+			return -1;
+
+		options = atoi(buf);
+
+		for (i = 0; i < options; i++) {
+			/* next is the size of the options */
+			n = read_string(fd, buf, BUFSIZ);
+			if (n == BUFSIZ)
+				/** ERROR **/
+				return -1;
+			size = atoi(buf);
+			/* prevent a client from killing us */
+			if (size > MAX_OPTION_SIZE)
+				return -1;
+			option = malloc_or_die(size);
+			do {
+				t = size;
+				s = 0;
+				s = read(fd, option+s, t);
+				if (s <= 0)
+					return -1;
+				t -= s;
+				s = size - t;
+			} while (t);
+
+			s = process_option(option);
+			free(option);
+			/* do we understand this option? */
+			if (!s)
+				return -1;
+		}
 	}
 
 	if (use_tcp)
@@ -360,12 +486,30 @@ static int communicate_with_client(int fd, int *cpus, int *pagesize)
 	return 0;
 }
 
-static int create_client_file(const char *node, const char *port)
+static int communicate_with_client_virt(int fd, const char *domain,  int *cpus, int *pagesize)
+{
+	proto_ver = V2_PROTOCOL;
+
+	if (tracecmd_msg_set_connection(fd, domain) < 0)
+		return -1;
+
+	/* read the CPU count, the page size, and options */
+	if (tracecmd_msg_initial_setting(fd, cpus, pagesize) < 0)
+		return -1;
+
+	return 0;
+}
+
+static int create_client_file(const char *node, const char *port,
+			      const char *domain, int pid)
 {
 	char buf[BUFSIZ];
 	int ofd;
 
-	snprintf(buf, BUFSIZ, "%s.%s:%s.dat", output_file, node, port);
+	if (node)
+		snprintf(buf, BUFSIZ, "%s.%s:%s.dat", output_file, node, port);
+	else
+		snprintf(buf, BUFSIZ, "%s.%s:%d.dat", output_file, domain, pid);
 
 	ofd = open(buf, O_RDWR | O_CREAT | O_TRUNC, 0644);
 	if (ofd < 0)
@@ -374,7 +518,8 @@ static int create_client_file(const char *node, const char *port)
 }
 
 static void destroy_all_readers(int cpus, int *pid_array, const char *node,
-				const char *port)
+				const char *port, const char *domain,
+				int virtpid)
 {
 	int cpu;
 
@@ -382,36 +527,48 @@ static void destroy_all_readers(int cpus, int *pid_array, const char *node,
 		if (pid_array[cpu] > 0) {
 			kill(pid_array[cpu], SIGKILL);
 			waitpid(pid_array[cpu], NULL, 0);
-			delete_temp_file(node, port, cpu);
+			delete_temp_file(node, port, domain, virtpid, cpu);
 			pid_array[cpu] = 0;
 		}
 	}
 }
 
 static int *create_all_readers(int cpus, const char *node, const char *port,
-			       int pagesize, int fd)
+			       const char *domain, int virtpid, int pagesize, int fd)
 {
 	char buf[BUFSIZ];
-	int *port_array;
+	int *port_array = NULL;
 	int *pid_array;
 	int start_port;
 	int udp_port;
 	int cpu;
 	int pid;
 
-	port_array = malloc_or_die(sizeof(int) * cpus);
+	if (node) {
+		port_array = malloc_or_die(sizeof(int) * cpus);
+		start_port = START_PORT_SEARCH;
+	}
 	pid_array = malloc_or_die(sizeof(int) * cpus);
 	memset(pid_array, 0, sizeof(int) * cpus);
 
-	start_port = START_PORT_SEARCH;
-
-	/* Now create a UDP port for each CPU */
+	/* Now create a reader for each CPU */
 	for (cpu = 0; cpu < cpus; cpu++) {
-		udp_port = open_udp(node, port, &pid, cpu,
-				    pagesize, start_port);
-		if (udp_port < 0)
-			goto out_free;
-		port_array[cpu] = udp_port;
+		if (node) {
+			udp_port = open_udp(node, port, &pid, cpu,
+					    pagesize, start_port);
+			if (udp_port < 0)
+				goto out_free;
+			port_array[cpu] = udp_port;
+			/*
+			 * due to some bugging finding ports,
+			 * force search after last port
+			 */
+			start_port = udp_port + 1;
+		} else {
+			if (open_virtio_serial_pipe(&pid, cpu, pagesize,
+						    domain, virtpid) < 0)
+				goto out_free;
+		}
 		pid_array[cpu] = pid;
 		/*
 		 * Due to some bugging finding ports,
@@ -420,19 +577,25 @@ static int *create_all_readers(int cpus, const char *node, const char *port,
 		start_port = udp_port + 1;
 	}
 
-	/* send the client a comma deliminated set of port numbers */
-	for (cpu = 0; cpu < cpus; cpu++) {
-		snprintf(buf, BUFSIZ, "%s%d",
-			 cpu ? "," : "", port_array[cpu]);
-		write(fd, buf, strlen(buf));
+	if (proto_ver == V2_PROTOCOL) {
+		/* send set of port numbers to the client */
+		if (tracecmd_msg_send_port_array(fd, cpus, port_array) < 0)
+			goto out_free;
+	} else {
+		/* send the client a comma deliminated set of port numbers */
+		for (cpu = 0; cpu < cpus; cpu++) {
+			snprintf(buf, BUFSIZ, "%s%d",
+				 cpu ? "," : "", port_array[cpu]);
+			write(fd, buf, strlen(buf));
+		}
+		/* end with null terminator */
+		write(fd, "\0", 1);
 	}
-	/* end with null terminator */
-	write(fd, "\0", 1);
 
 	return pid_array;
 
  out_free:
-	destroy_all_readers(cpus, pid_array, node, port);
+	destroy_all_readers(cpus, pid_array, node, port, domain, virtpid);
 	return NULL;
 }
 
@@ -474,7 +637,7 @@ static void stop_all_readers(int cpus, int *pid_array)
 }
 
 static void put_together_file(int cpus, int ofd, const char *node,
-			      const char *port)
+			      const char *port, const char *domain, int virtpid)
 {
 	char **temp_files;
 	int cpu;
@@ -483,30 +646,39 @@ static void put_together_file(int cpus, int ofd, const char *node,
 	temp_files = malloc_or_die(sizeof(*temp_files) * cpus);
 
 	for (cpu = 0; cpu < cpus; cpu++)
-		temp_files[cpu] = get_temp_file(node, port, cpu);
+		temp_files[cpu] = get_temp_file(node, port, domain,
+						virtpid, cpu);
 
 	tracecmd_attach_cpu_data_fd(ofd, cpus, temp_files);
 	free(temp_files);
 }
 
-static void process_client(const char *node, const char *port, int fd)
+static void process_client(const char *node, const char *port,
+			   const char *domain, int virtpid, int fd)
 {
 	int *pid_array;
 	int pagesize;
 	int cpus;
 	int ofd;
 
-	if (communicate_with_client(fd, &cpus, &pagesize) < 0)
-		return;
+	if (node) {
+		if (communicate_with_client_nw(fd, &cpus, &pagesize) < 0)
+			return;
+	} else {
+		if (communicate_with_client_virt(fd, domain, &cpus, &pagesize) < 0)
+			return;
+	}
 
-	ofd = create_client_file(node, port);
-
-	pid_array = create_all_readers(cpus, node, port, pagesize, fd);
+	ofd = create_client_file(node, port, domain, virtpid);
+	pid_array = create_all_readers(cpus, node, port, domain, virtpid, pagesize, fd);
 	if (!pid_array)
 		return;
 
 	/* Now we are ready to start reading data from the client */
-	collect_metadata_from_client(fd, ofd);
+	if (proto_ver == V2_PROTOCOL)
+		tracecmd_msg_collect_metadata(fd, ofd);
+	else
+		collect_metadata_from_client(fd, ofd);
 
 	/* wait a little to let our readers finish reading */
 	sleep(1);
@@ -517,9 +689,22 @@ static void process_client(const char *node, const char *port, int fd)
 	/* wait a little to have the readers clean up */
 	sleep(1);
 
-	put_together_file(cpus, ofd, node, port);
+	put_together_file(cpus, ofd, node, port, domain, virtpid);
 
-	destroy_all_readers(cpus, pid_array, node, port);
+	destroy_all_readers(cpus, pid_array, node, port, domain, virtpid);
+}
+
+static void process_client_nw(const char *node, const char *port, int fd)
+{
+	process_client(node, port, NULL, 0, fd);
+}
+
+static void process_client_virt(const char *domain, int virtpid, int fd)
+{
+	/* keep connection to qemu if clients on guests finish operation */
+	do {
+		process_client(NULL, NULL, domain, virtpid, fd);
+	} while (!done);
 }
 
 static int do_fork(int cfd)
@@ -546,8 +731,8 @@ static int do_fork(int cfd)
 	return 0;
 }
 
-static int do_connection(int cfd, struct sockaddr_storage *peer_addr,
-			  socklen_t peer_addr_len)
+static int do_connection(int cfd, struct sockaddr *peer_addr,
+			 socklen_t *peer_addr_len, const char *domain, int virtpid)
 {
 	char host[NI_MAXHOST], service[NI_MAXSERV];
 	int s;
@@ -557,21 +742,22 @@ static int do_connection(int cfd, struct sockaddr_storage *peer_addr,
 	if (ret)
 		return ret;
 
-	s = getnameinfo((struct sockaddr *)peer_addr, peer_addr_len,
-			host, NI_MAXHOST,
-			service, NI_MAXSERV, NI_NUMERICSERV);
-
-	if (s == 0)
-		plog("Connected with %s:%s\n",
-		       host, service);
-	else {
-		plog("Error with getnameinfo: %s\n",
-		       gai_strerror(s));
-		close(cfd);
-		return -1;
-	}
-
-	process_client(host, service, cfd);
+	if (peer_addr) {
+		s = getnameinfo(peer_addr, *peer_addr_len, host, NI_MAXHOST,
+				service, NI_MAXSERV, NI_NUMERICSERV);
+	
+		if (s == 0)
+			plog("Connected with %s:%s\n",
+			       host, service);
+		else {
+			plog("Error with getnameinfo: %s\n",
+			       gai_strerror(s));
+			close(cfd);
+			return -1;
+		}
+		process_client_nw(host, service, cfd);
+	} else
+		process_client_virt(domain, virtpid, cfd);
 
 	close(cfd);
 
@@ -579,6 +765,77 @@ static int do_connection(int cfd, struct sockaddr_storage *peer_addr,
 		exit(0);
 
 	return 0;
+}
+
+static int do_connection_nw(int cfd, struct sockaddr *addr, socklen_t *addrlen)
+{
+	return do_connection(cfd, addr, addrlen, NULL, 0);
+}
+
+#define LIBVIRT_DOMAIN_PATH     "/var/run/libvirt/qemu/"
+
+/* We can convert pid to domain name of a guest when we use libvirt. */
+static char *get_guest_domain_from_pid(int pid)
+{
+	struct dirent *dirent;
+	char file_name[NAME_MAX];
+	char *file_name_ret, *domain;
+	char buf[BUFSIZ];
+	DIR *dir;
+	size_t doml;
+	int fd;
+
+	dir = opendir(LIBVIRT_DOMAIN_PATH);
+	if (!dir) {
+		if (errno == ENOENT)
+			warning("Only support for using libvirt");
+		return NULL;
+	}
+
+	for (dirent = readdir(dir); dirent != NULL; dirent = readdir(dir)) {
+		snprintf(file_name, NAME_MAX, LIBVIRT_DOMAIN_PATH"%s",
+			 dirent->d_name);
+		file_name_ret = strstr(file_name, ".pid");
+		if (file_name_ret) {
+			fd = open(file_name, O_RDONLY);
+			if (fd < 0)
+				return NULL;
+			if (read(fd, buf, BUFSIZ) < 0)
+				return NULL;
+
+			if (pid == atoi(buf)) {
+				/* not include /var/run/libvirt/qemu */
+				doml = (size_t)(file_name_ret - file_name)
+					- strlen(LIBVIRT_DOMAIN_PATH);
+				domain = strndup(file_name +
+						 strlen(LIBVIRT_DOMAIN_PATH),
+						 doml);
+				plog("start %s:%d\n", domain, pid);
+				return domain;
+			}
+		}
+	}
+
+	return NULL;
+}
+
+static int do_connection_virt(int cfd)
+{
+	struct ucred cr;
+	socklen_t cl;
+	int ret;
+	char *domain;
+
+	cl = sizeof(cr);
+	ret = getsockopt(cfd, SOL_SOCKET, SO_PEERCRED, &cr, &cl);
+	if (ret < 0)
+		return ret;
+
+	domain = get_guest_domain_from_pid(cr.pid);
+	if (!domain)
+		return -1;
+
+	return do_connection(cfd, NULL, NULL, domain, cr.pid);
 }
 
 static int *client_pids;
@@ -625,12 +882,11 @@ static void remove_process(int pid)
 
 static void kill_clients(void)
 {
-	int status;
 	int i;
 
 	for (i = 0; i < saved_pids; i++) {
 		kill(client_pids[i], SIGINT);
-		waitpid(client_pids[i], &status, 0);
+		waitpid(client_pids[i], NULL, 0);
 	}
 
 	saved_pids = 0;
@@ -649,31 +905,51 @@ static void clean_up(int sig)
 	} while (ret > 0);
 }
 
-static void do_accept_loop(int sfd)
+static void do_accept_loop(int sfd, bool nw, struct sockaddr *addr,
+			   socklen_t *addrlen)
 {
-	struct sockaddr_storage peer_addr;
-	socklen_t peer_addr_len;
 	int cfd, pid;
 
-	peer_addr_len = sizeof(peer_addr);
-
 	do {
-		cfd = accept(sfd, (struct sockaddr *)&peer_addr,
-			     &peer_addr_len);
+		cfd = accept(sfd, addr, addrlen);
 		printf("connected!\n");
 		if (cfd < 0 && errno == EINTR)
 			continue;
 		if (cfd < 0)
 			pdie("connecting");
 
-		pid = do_connection(cfd, &peer_addr, peer_addr_len);
+		if (nw)
+			pid = do_connection_nw(cfd, addr, addrlen);
+		else
+			pid = do_connection_virt(cfd);
 		if (pid > 0)
 			add_process(pid);
 
 	} while (!done);
 }
 
-static void do_listen(char *port)
+static void do_accept_loop_nw(int sfd)
+{
+	struct sockaddr_storage peer_addr;
+	socklen_t peer_addr_len;
+
+	peer_addr_len = sizeof(peer_addr);
+
+	do_accept_loop(sfd, true, (struct sockaddr *)&peer_addr,
+		       &peer_addr_len);
+}
+
+static void do_accept_loop_virt(int sfd)
+{
+	struct sockaddr_un un_addr;
+	socklen_t un_addrlen;
+
+	un_addrlen = sizeof(un_addr);
+
+	do_accept_loop(sfd, false, (struct sockaddr *)&un_addr, &un_addrlen);
+}
+
+static void do_listen_nw(char *port)
 {
 	struct addrinfo hints;
 	struct addrinfo *result, *rp;
@@ -711,8 +987,64 @@ static void do_listen(char *port)
 	if (listen(sfd, backlog) < 0)
 		pdie("listen");
 
-	do_accept_loop(sfd);
+	do_accept_loop_nw(sfd);
 
+	kill_clients();
+}
+
+static void make_virt_if_dir(void)
+{
+	struct group *group;
+
+	if (mkdir(TRACE_CMD_DIR, 0710) < 0) {
+		if (errno != EEXIST)
+			pdie("mkdir %s", TRACE_CMD_DIR);
+	}
+	/* QEMU operates as qemu:qemu */
+	chmod(TRACE_CMD_DIR, 0710);
+	group = getgrnam("qemu");
+	if (chown(TRACE_CMD_DIR, -1, group->gr_gid) < 0)
+		pdie("chown %s", TRACE_CMD_DIR);
+
+	if (mkdir(VIRT_DIR, 0710) < 0) {
+		if (errno != EEXIST)
+			pdie("mkdir %s", VIRT_DIR);
+	}
+	chmod(VIRT_DIR, 0710);
+	if (chown(VIRT_DIR, -1, group->gr_gid) < 0)
+		pdie("chown %s", VIRT_DIR);
+}
+
+static void do_listen_virt(void)
+{
+	struct sockaddr_un un_server;
+	struct group *group;
+	socklen_t slen;
+	int sfd;
+
+	make_virt_if_dir();
+
+	slen = sizeof(un_server);
+	sfd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (sfd < 0)
+		pdie("socket");
+
+	un_server.sun_family = AF_UNIX;
+	snprintf(un_server.sun_path, PATH_MAX, VIRT_TRACE_CTL_SOCK);
+
+	if (bind(sfd, (struct sockaddr *)&un_server, slen) < 0)
+		pdie("bind");
+	chmod(VIRT_TRACE_CTL_SOCK, 0660);
+	group = getgrnam("qemu");
+	if (chown(VIRT_TRACE_CTL_SOCK, -1, group->gr_gid) < 0)
+		pdie("fchown %s", VIRT_TRACE_CTL_SOCK);
+
+	if (listen(sfd, backlog) < 0)
+		pdie("listen");
+
+	do_accept_loop_virt(sfd);
+
+	unlink(VIRT_TRACE_CTL_SOCK);
 	kill_clients();
 }
 
@@ -732,11 +1064,17 @@ void trace_listen(int argc, char **argv)
 	char *port = NULL;
 	int daemon = 0;
 	int c;
+	int nw = 0;
+	int virt = 0;
 
 	if (argc < 2)
 		usage(argv);
 
-	if (strcmp(argv[1], "listen") != 0)
+	if ((nw = (strcmp(argv[1], "listen") == 0)))
+		; /* do nothing */
+	else if ((virt = (strcmp(argv[1], "virt-server") == 0)))
+		; /* do nothing */
+	else
 		usage(argv);
 
 	for (;;) {
@@ -757,6 +1095,8 @@ void trace_listen(int argc, char **argv)
 			usage(argv);
 			break;
 		case 'p':
+			if (virt)
+				die("-p only available with listen");
 			port = optarg;
 			break;
 		case 'd':
@@ -779,7 +1119,7 @@ void trace_listen(int argc, char **argv)
 		}
 	}
 
-	if (!port)
+	if (!port && nw)
 		usage(argv);
 
 	if ((argc - optind) >= 2)
@@ -807,7 +1147,10 @@ void trace_listen(int argc, char **argv)
 	signal_setup(SIGINT, finish);
 	signal_setup(SIGTERM, finish);
 
-	do_listen(port);
+	if (nw)
+		do_listen_nw(port);
+	else
+		do_listen_virt();
 
 	return;
 }

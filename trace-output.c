@@ -36,6 +36,7 @@
 #include <glob.h>
 
 #include "trace-cmd-local.h"
+#include "trace-msg.h"
 #include "version.h"
 
 /* We can't depend on the host size for size_t, all must be 64 bit */
@@ -80,6 +81,9 @@ struct list_event_system {
 static stsize_t
 do_write_check(struct tracecmd_output *handle, void *data, tsize_t size)
 {
+	if (send_metadata)
+		return tracecmd_msg_metadata_send(handle->fd, data, size);
+
 	return __do_write_check(handle->fd, data, size);
 }
 
