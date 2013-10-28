@@ -1000,12 +1000,14 @@ static void make_virt_if_dir(void)
 		if (errno != EEXIST)
 			pdie("mkdir %s", TRACE_CMD_DIR);
 	}
-	/* QEMU operates as qemu:qemu */
+
+	/* TODO - add command line arg for group?   It varies by distro.*/
+#define QEMU_GROUP	"libvirtd"
 	chmod(TRACE_CMD_DIR, 0710);
 	errno = 0;
-	group = getgrnam("qemu");
+	group = getgrnam(QEMU_GROUP);
 	if (group == NULL) 
-		pdie("getgrnam(\"qemu\")");
+		pdie("getgrnam(QEMU_GROUP)");
 
 	if (chown(TRACE_CMD_DIR, -1, group->gr_gid) < 0)
 		pdie("chown %s", TRACE_CMD_DIR);
