@@ -1002,7 +1002,11 @@ static void make_virt_if_dir(void)
 	}
 	/* QEMU operates as qemu:qemu */
 	chmod(TRACE_CMD_DIR, 0710);
+	errno = 0;
 	group = getgrnam("qemu");
+	if (group == NULL) 
+		pdie("getgrnam(\"qemu\")");
+
 	if (chown(TRACE_CMD_DIR, -1, group->gr_gid) < 0)
 		pdie("chown %s", TRACE_CMD_DIR);
 
