@@ -1041,7 +1041,7 @@ static void do_listen_virt(void)
 	if (bind(sfd, (struct sockaddr *)&un_server, slen) < 0)
 		pdie("bind");
 	chmod(VIRT_TRACE_CTL_SOCK, 0660);
-	group = getgrnam("qemu");
+	group = getgrnam(QEMU_GROUP);
 	if (chown(VIRT_TRACE_CTL_SOCK, -1, group->gr_gid) < 0)
 		pdie("fchown %s", VIRT_TRACE_CTL_SOCK);
 
