@@ -2096,7 +2096,10 @@ static unsigned long long find_time_stamp(struct pevent *pevent)
 		if (fd < 0)
 			continue;
 		do {
+			/* XXX AJF hanging here */
 			r = read(fd, page, page_size);
+			if (r < 0) 
+				break;
 			ts = find_ts_in_page(pevent, page, r);
 			if (ts)
 				break;
@@ -2212,12 +2215,17 @@ static char *get_date_to_ts(void)
 		disable_tracing();
 		clear_trace();
 		enable_tracing();
-
 		gettimeofday(&start, NULL);
-		write(tfd, STAMP, 5);
+		ret = write(tfd, STAMP, 5);
 		gettimeofday(&end, NULL);
 
 		disable_tracing();
+		if (ret < 0) {
+			warning("Error %d writing trace_marker "
+				"for --date\n", errno); 
+			goto out_pevent;
+		}
+
 		ts = find_time_stamp(pevent);
 		if (!ts)
 			continue;
