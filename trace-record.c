@@ -2096,11 +2096,11 @@ static unsigned long long find_time_stamp(struct pevent *pevent)
 		if (fd < 0)
 			continue;
 		do {
+			printf("%s: read %s\n", __func__, file);
 			/* XXX AJF hanging here */
 			r = read(fd, page, page_size);
 			if (r < 0) 
 				break;
-			printf("%s: read %s\n", __func__, file);
 			ts = find_ts_in_page(pevent, page, r);
 			if (ts)
 				break;
