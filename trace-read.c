@@ -779,7 +779,6 @@ test_filters(struct filter *event_filters, struct pevent_record *record, int neg
 static struct pevent_record *
 get_next_record(struct handle_list *handles, int *next_cpu)
 {
-	unsigned long long ts;
 	struct pevent_record *record;
 	int found = 0;
 	int next;
@@ -794,7 +793,6 @@ get_next_record(struct handle_list *handles, int *next_cpu)
 
 	do {
 		next = -1;
-		ts = 0;
 		if (filter_cpus) {
 			long long last_stamp = -1;
 			struct pevent_record *precord;
@@ -950,6 +948,8 @@ static void read_data_info(struct list_head *handle_list, int stat_only)
 		last_record = NULL;
 
 		list_for_each_entry(handles, handle_list, list) {
+			/* This doesn't consume the record.  That happens
+			 * in free_handle_record() below.  */
 			record = get_next_record(handles, &next);
 			if (!last_record ||
 			    (record && record->ts < last_record->ts)) {
