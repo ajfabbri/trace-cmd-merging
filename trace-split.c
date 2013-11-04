@@ -424,14 +424,13 @@ void trace_split (int argc, char **argv)
 	int count;
 	int repeat = 0;
 	int percpu = 0;
-	int cpu = -1;
 	int ac;
 	int c;
 
 	if (strcmp(argv[1], "split") != 0)
 		usage(argv);
 
-	while ((c = getopt(argc-1, argv+1, "+ho:i:s:m:u:e:p:rcC:")) >= 0) {
+	while ((c = getopt(argc-1, argv+1, "+ho:i:s:m:u:e:p:rc")) >= 0) {
 		switch (c) {
 		case 'h':
 			usage(argv);
@@ -462,9 +461,6 @@ void trace_split (int argc, char **argv)
 			break;
 		case 'c':
 			percpu = 1;
-			break;
-		case 'C':
-			cpu = atoi(optarg);
 			break;
 		case 'o':
 			if (output)
