@@ -2100,6 +2100,7 @@ static unsigned long long find_time_stamp(struct pevent *pevent)
 			r = read(fd, page, page_size);
 			if (r < 0) 
 				break;
+			printf("%s: read %s\n", __func__, file);
 			ts = find_ts_in_page(pevent, page, r);
 			if (ts)
 				break;
@@ -2205,6 +2206,7 @@ static char *get_date_to_ts(void)
 
 	path = tracecmd_get_tracing_file("trace_marker");
 	tfd = open(path, O_WRONLY);
+	printf("%s: path %s\n", __func__, path);
 	tracecmd_put_tracing_file(path);
 	if (tfd < 0) {
 		warning("Can not open 'trace_marker', --date ignored");
@@ -2216,6 +2218,7 @@ static char *get_date_to_ts(void)
 		clear_trace();
 		enable_tracing();
 		gettimeofday(&start, NULL);
+		printf("%s: writing STAMP\n", __func__);
 		ret = write(tfd, STAMP, 5);
 		gettimeofday(&end, NULL);
 
